@@ -1,18 +1,17 @@
 """
 AstroTeric — Backend (Ephemeris + Assistant)
 =============================================
-A small FastAPI server with two jobs:
+  1. EPHEMERIS  — true planetary positions, Ascendant, Midheaven.
+  2. ASSISTANT  — a grounded, honest chart-and-esoteric assistant.
 
-  1. EPHEMERIS  — compute true planetary positions, the Ascendant
-                  (rising sign), and the Midheaven (Swiss Ephemeris).
-  2. ASSISTANT  — answer questions about a chart, or general esoteric
-                  questions, using Claude. A grounded practitioner's
-                  tool: honest, never sugar-coated, knows its limits.
+The assistant calls the Anthropic API directly over HTTPS (httpx)
+rather than through the anthropic SDK, which sidesteps SDK/runtime
+connection quirks on some hosts.
 
 Endpoints:
   GET  /        — health check
-  POST /chart   — compute a natal chart from birth data
-  POST /ask     — ask the AstroTeric assistant a question
+  POST /chart   — compute a natal chart
+  POST /ask     — ask the AstroTeric assistant
 """
 
 import os
@@ -23,9 +22,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import swisseph as swe
-import anthropic
+import httpx
 
-app = FastAPI(title="AstroTeric Backend", version="2.0.0")
+app = FastAPI(title="AstroTeric Backend", version="2.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,7 +34,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Signs and planets ──────────────────────────────────────────────
 SIGNS = [
     "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
     "Libra", "Scorpio", "Sagittarius", "Capricorn", "Aquarius", "Pisces",
@@ -77,7 +75,7 @@ def health():
     return {
         "status": "alive",
         "service": "AstroTeric Backend",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "ephemeris": True,
         "assistant": bool(os.environ.get("ANTHROPIC_API_KEY")),
     }
@@ -115,12 +113,8 @@ def compute_chart(req: ChartRequest):
 
 
 # ════════════════════════════════════════════════════════════════
-# ASSISTANT — the AstroTeric bot
+# ASSISTANT
 # ════════════════════════════════════════════════════════════════
-
-# The assistant's character. This is the heart of the bot — it defines
-# how it behaves. Grounded, honest, never sugar-coated; a tool for the
-# practitioner and the serious newcomer alike.
 SYSTEM_PROMPT = """You are the AstroTeric Assistant — a knowledgeable, honest guide \
 within the AstroTeric app, which blends numerology, Western astrology, Chinese \
 zodiac, and BaZi (Four Pillars).
@@ -142,16 +136,14 @@ a practitioner should respect you.
 deterministic science. Frame readings as lenses for reflection, to be tested against \
 real life — never as fixed fate or prediction.
 
-FIRM LIMITS — these are not negotiable:
+FIRM LIMITS — not negotiable:
 - No medical advice or health diagnoses. Redirect to a doctor.
 - No legal or financial advice. No specific investment, trade, or money guidance.
 - No hard predictions of the future — no death, no disaster, no "you will" certainties.
-- No definitive relationship verdicts ("you must leave," "you are doomed together"). \
-Compatibility describes dynamics, never decrees outcomes.
+- No definitive relationship verdicts. Compatibility describes dynamics, never decrees.
 - If a question is distressing or implies crisis, respond with care and gently \
 suggest talking to a trusted person or professional.
-You are an assistant to the person's own judgment — never a replacement for it. The \
-reader, or the person, decides; you inform.
+You assist the person's own judgment — never replace it.
 
 STYLE
 Concise and substantial — usually 2-4 short paragraphs. No filler. You may use the \
@@ -161,9 +153,7 @@ relevant, point the person toward the app's Teachings for depth."""
 
 class AskRequest(BaseModel):
     question: str
-    # Optional chart context — the app sends what it has computed.
     chart_context: Optional[str] = None
-    # Optional short prior exchange, for follow-up questions.
     history: Optional[list] = None
 
 
@@ -178,43 +168,61 @@ def ask_assistant(req: AskRequest):
     if not req.question or not req.question.strip():
         raise HTTPException(status_code=400, detail="No question was provided.")
 
+    # Build the message list.
+    messages = []
+    if req.history:
+        for turn in req.history[-6:]:
+            role = turn.get("role")
+            content = turn.get("content", "")
+            if role in ("user", "assistant") and content:
+                messages.append({"role": role, "content": content})
+
+    user_content = req.question.strip()
+    if req.chart_context:
+        user_content = (
+            f"[The person's chart data, computed by AstroTeric:]\n"
+            f"{req.chart_context}\n\n"
+            f"[Their question:]\n{req.question.strip()}"
+        )
+    messages.append({"role": "user", "content": user_content})
+
+    payload = {
+        "model": "claude-3-5-haiku-20241022",
+        "max_tokens": 900,
+        "system": SYSTEM_PROMPT,
+        "messages": messages,
+    }
+    headers = {
+        "x-api-key": api_key.strip(),
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+
     try:
-        client = anthropic.Anthropic(api_key=api_key)
-
-        # Build the conversation. Prior history first (if any), then the
-        # current question with its chart context attached.
-        messages = []
-        if req.history:
-            for turn in req.history[-6:]:  # cap history length
-                role = turn.get("role")
-                content = turn.get("content", "")
-                if role in ("user", "assistant") and content:
-                    messages.append({"role": role, "content": content})
-
-        user_content = req.question.strip()
-        if req.chart_context:
-            user_content = (
-                f"[The person's chart data, computed by AstroTeric:]\n"
-                f"{req.chart_context}\n\n"
-                f"[Their question:]\n{req.question.strip()}"
+        with httpx.Client(timeout=60.0) as client:
+            resp = client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json=payload,
             )
-        messages.append({"role": "user", "content": user_content})
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not reach the AI service: {e}")
 
-        response = client.messages.create(
-            model="claude-3-5-haiku-20241022",
-            max_tokens=900,
-            system=SYSTEM_PROMPT,
-            messages=messages,
+    if resp.status_code != 200:
+        # Pass through the API's own error text so problems are visible.
+        detail = resp.text[:300]
+        raise HTTPException(
+            status_code=502,
+            detail=f"AI service returned {resp.status_code}: {detail}",
         )
 
-        # Collect the text from the response.
+    try:
+        data = resp.json()
         answer = "".join(
-            block.text for block in response.content
-            if getattr(block, "type", None) == "text"
+            block.get("text", "")
+            for block in data.get("content", [])
+            if block.get("type") == "text"
         )
         return {"ok": True, "answer": answer.strip()}
-
-    except anthropic.APIStatusError as e:
-        raise HTTPException(status_code=502, detail=f"Assistant error: {e.status_code}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Assistant failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not read AI response: {e}")

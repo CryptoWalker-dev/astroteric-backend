@@ -187,7 +187,7 @@ def ask_assistant(req: AskRequest):
     messages.append({"role": "user", "content": user_content})
 
     payload = {
-        "model": "claude-3-5-haiku-20241022",
+        "model": "claude-haiku-4-5",
         "max_tokens": 900,
         "system": SYSTEM_PROMPT,
         "messages": messages,
@@ -226,3 +226,4 @@ def ask_assistant(req: AskRequest):
         return {"ok": True, "answer": answer.strip()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not read AI response: {e}")
+

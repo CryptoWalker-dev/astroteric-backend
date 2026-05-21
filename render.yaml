@@ -1,0 +1,9 @@
+# Render deployment config for the AstroTeric ephemeris backend.
+# Render reads this file automatically and knows how to build and run the server.
+services:
+  - type: web
+    name: astroteric-backend
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT

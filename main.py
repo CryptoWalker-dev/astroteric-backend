@@ -1,3 +1,4 @@
+
 """
 AstroTeric — Backend (Ephemeris + Assistant)
 =============================================
@@ -24,7 +25,7 @@ from pydantic import BaseModel
 import swisseph as swe
 import httpx
 
-app = FastAPI(title="AstroTeric Backend", version="2.1.0")
+app = FastAPI(title="AstroTeric Backend", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -49,6 +50,8 @@ PLANETS = {
 def sign_of(longitude: float) -> dict:
     longitude = longitude % 360.0
     index = int(longitude // 30)
+    if index > 11:
+        index = 11
     return {
         "sign": SIGNS[index],
         "degree": round(longitude - index * 30, 2),
@@ -75,8 +78,9 @@ def health():
     return {
         "status": "alive",
         "service": "AstroTeric Backend",
-        "version": "2.1.0",
+        "version": "3.0.0",
         "ephemeris": True,
+        "jyotish": True,
         "assistant": bool(os.environ.get("ANTHROPIC_API_KEY")),
     }
 
@@ -110,6 +114,161 @@ def compute_chart(req: ChartRequest):
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Chart calculation failed: {e}")
+
+
+# ════════════════════════════════════════════════════════════════
+# JYOTISH — Vedic (sidereal) chart
+#
+# Jyotish uses the SIDEREAL zodiac, aligned to the fixed stars,
+# rather than the tropical zodiac of Western astrology. The two
+# differ by the "ayanamsha" (~24 degrees). The standard ayanamsha
+# for Jyotish is Lahiri. This endpoint also computes the Moon's
+# nakshatra — one of the 27 lunar mansions, central to Jyotish.
+# ════════════════════════════════════════════════════════════════
+
+# The 27 nakshatras, in order from 0 degrees sidereal Aries.
+NAKSHATRAS = [
+    "Ashwini", "Bharani", "Krittika", "Rohini", "Mrigashira", "Ardra",
+    "Punarvasu", "Pushya", "Ashlesha", "Magha", "Purva Phalguni",
+    "Uttara Phalguni", "Hasta", "Chitra", "Swati", "Vishakha",
+    "Anuradha", "Jyeshtha", "Mula", "Purva Ashadha", "Uttara Ashadha",
+    "Shravana", "Dhanishta", "Shatabhisha", "Purva Bhadrapada",
+    "Uttara Bhadrapada", "Revati",
+]
+
+# The dasha lord sequence (Vimshottari), and each lord's period in years.
+DASHA_LORDS = [
+    ("Ketu", 7), ("Venus", 20), ("Sun", 6), ("Moon", 10), ("Mars", 7),
+    ("Rahu", 18), ("Jupiter", 16), ("Saturn", 19), ("Mercury", 17),
+]
+# Each nakshatra is ruled by a dasha lord, cycling through the 9 lords.
+NAKSHATRA_LORD_ORDER = [
+    "Ketu", "Venus", "Sun", "Moon", "Mars", "Rahu", "Jupiter", "Saturn", "Mercury",
+]
+
+
+def nakshatra_of(moon_sidereal_lon: float) -> dict:
+    """Given the Moon's sidereal longitude, find its nakshatra and pada."""
+    lon = moon_sidereal_lon % 360.0
+    span = 360.0 / 27.0          # 13 deg 20 min per nakshatra
+    # A tiny epsilon guards against floating-point error at exact
+    # boundaries (e.g. 120.0 / span computing as 8.9999 instead of 9).
+    index = int((lon + 1e-9) // span)
+    if index > 26:
+        index = 26
+    position_in = lon - index * span
+    pada = int((position_in + 1e-9) // (span / 4.0)) + 1
+    if pada > 4:
+        pada = 4
+    lord = NAKSHATRA_LORD_ORDER[index % 9]
+    return {
+        "nakshatra": NAKSHATRAS[index],
+        "index": index,
+        "pada": pada,
+        "lord": lord,
+        "position": round(position_in, 3),
+        "span": span,
+    }
+
+
+def compute_vimshottari(moon_sidereal_lon: float, birth_jd: float):
+    """Compute the Vimshottari dasha sequence from the Moon's nakshatra.
+    Returns the starting dasha and the sequence of mahadasha periods."""
+    nak = nakshatra_of(moon_sidereal_lon)
+    span = nak["span"]
+    # Fraction of the nakshatra already traversed at birth.
+    fraction_done = nak["position"] / span
+    # Find the starting lord and its total period.
+    start_lord = nak["lord"]
+    lord_names = [l[0] for l in DASHA_LORDS]
+    start_idx = lord_names.index(start_lord)
+    start_period = DASHA_LORDS[start_idx][1]
+    # Balance of the first dasha remaining at birth.
+    balance_years = start_period * (1.0 - fraction_done)
+
+    # Build the mahadasha sequence: first the balance, then full periods.
+    sequence = []
+    age = 0.0
+    # First (partial) dasha
+    sequence.append({
+        "lord": start_lord,
+        "start_age": 0.0,
+        "end_age": round(balance_years, 2),
+        "full_period": start_period,
+        "partial": True,
+    })
+    age = balance_years
+    # The following eight full dashas
+    for i in range(1, 9):
+        lord, period = DASHA_LORDS[(start_idx + i) % 9]
+        sequence.append({
+            "lord": lord,
+            "start_age": round(age, 2),
+            "end_age": round(age + period, 2),
+            "full_period": period,
+            "partial": False,
+        })
+        age += period
+    return {"starting_lord": start_lord, "sequence": sequence}
+
+
+@app.post("/jyotish")
+def compute_jyotish(req: ChartRequest):
+    try:
+        local = datetime(
+            req.year, req.month, req.day, req.hour, req.minute,
+            tzinfo=timezone(timedelta(hours=req.tz_offset)),
+        )
+        ut = local.astimezone(timezone.utc)
+        jd = swe.julday(
+            ut.year, ut.month, ut.day,
+            ut.hour + ut.minute / 60.0 + ut.second / 3600.0,
+        )
+
+        # Switch Swiss Ephemeris into SIDEREAL mode, Lahiri ayanamsha.
+        swe.set_sid_mode(swe.SIDM_LAHIRI, 0, 0)
+        flag = swe.FLG_SWIEPH | swe.FLG_SIDEREAL
+
+        # Sidereal planetary positions.
+        planets = {}
+        moon_lon = None
+        for name, code in PLANETS.items():
+            result, _ = swe.calc_ut(jd, code, flag)
+            lon = result[0]
+            if name == "Moon":
+                moon_lon = lon
+            info = sign_of(lon)
+            info["retrograde"] = result[3] < 0
+            planets[name] = info
+
+        # Sidereal houses / Lagna (the Vedic rising sign).
+        houses, ascmc = swe.houses_ex(
+            jd, req.latitude, req.longitude, b"W", flag
+        )
+        lagna = sign_of(ascmc[0])
+
+        # The ayanamsha value used (for transparency).
+        ayanamsha = swe.get_ayanamsa_ut(jd)
+
+        # Nakshatra of the Moon, and the Vimshottari dasha sequence.
+        nak = nakshatra_of(moon_lon) if moon_lon is not None else None
+        dasha = compute_vimshottari(moon_lon, jd) if moon_lon is not None else None
+
+        # Reset to tropical so the /chart endpoint is unaffected.
+        swe.set_sid_mode(swe.SIDM_FAGAN_BRADLEY, 0, 0)
+
+        return {
+            "ok": True,
+            "system": "Jyotish (sidereal, Lahiri ayanamsha)",
+            "julian_day": round(jd, 6),
+            "ayanamsha": round(ayanamsha, 4),
+            "planets": planets,
+            "lagna": lagna,
+            "moon_nakshatra": nak,
+            "dasha": dasha,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Jyotish calculation failed: {e}")
 
 
 # ════════════════════════════════════════════════════════════════
@@ -226,4 +385,3 @@ def ask_assistant(req: AskRequest):
         return {"ok": True, "answer": answer.strip()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not read AI response: {e}")
-

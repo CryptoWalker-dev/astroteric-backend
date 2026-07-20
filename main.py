@@ -1,18 +1,21 @@
 
+
 """
 AstroTeric — Backend (Ephemeris + Assistant)
 =============================================
-  1. EPHEMERIS  — true planetary positions, Ascendant, Midheaven.
-  2. ASSISTANT  — a grounded, honest chart-and-esoteric assistant.
+A small FastAPI server with two jobs:
 
-The assistant calls the Anthropic API directly over HTTPS (httpx)
-rather than through the anthropic SDK, which sidesteps SDK/runtime
-connection quirks on some hosts.
+  1. EPHEMERIS  — compute true planetary positions, the Ascendant
+                  (rising sign), and the Midheaven (Swiss Ephemeris).
+  2. ASSISTANT  — answer questions about a chart, or general esoteric
+                  questions, using Claude. A grounded practitioner's
+                  tool: honest, never sugar-coated, knows its limits.
 
 Endpoints:
   GET  /        — health check
-  POST /chart   — compute a natal chart
-  POST /ask     — ask the AstroTeric assistant
+  POST /chart   — compute a natal chart from birth data (tropical / Western)
+  POST /jyotish — compute a sidereal Vedic chart: nakshatra + Vimshottari dasha
+  POST /ask     — ask the AstroTeric assistant a question
 """
 
 import os
@@ -23,9 +26,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import swisseph as swe
-import httpx
+import anthropic
 
-app = FastAPI(title="AstroTeric Backend", version="3.0.0")
+app = FastAPI(title="AstroTeric Backend", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,6 +38,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Signs and planets ──────────────────────────────────────────────
 SIGNS = [
     "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
     "Libra", "Scorpio", "Sagittarius", "Capricorn", "Aquarius", "Pisces",
@@ -50,8 +54,6 @@ PLANETS = {
 def sign_of(longitude: float) -> dict:
     longitude = longitude % 360.0
     index = int(longitude // 30)
-    if index > 11:
-        index = 11
     return {
         "sign": SIGNS[index],
         "degree": round(longitude - index * 30, 2),
@@ -78,7 +80,7 @@ def health():
     return {
         "status": "alive",
         "service": "AstroTeric Backend",
-        "version": "3.0.0",
+        "version": "2.0.0",
         "ephemeris": True,
         "jyotish": True,
         "assistant": bool(os.environ.get("ANTHROPIC_API_KEY")),
@@ -117,104 +119,35 @@ def compute_chart(req: ChartRequest):
 
 
 # ════════════════════════════════════════════════════════════════
-# JYOTISH — Vedic (sidereal) chart
-#
-# Jyotish uses the SIDEREAL zodiac, aligned to the fixed stars,
-# rather than the tropical zodiac of Western astrology. The two
-# differ by the "ayanamsha" (~24 degrees). The standard ayanamsha
-# for Jyotish is Lahiri. This endpoint also computes the Moon's
-# nakshatra — one of the 27 lunar mansions, central to Jyotish.
+# JYOTISH (Vedic) — sidereal chart, Moon's nakshatra, Vimshottari dasha
 # ════════════════════════════════════════════════════════════════
-
-# The 27 nakshatras, in order from 0 degrees sidereal Aries.
+# The 27 nakshatras (lunar mansions), in order from 0deg sidereal Aries.
 NAKSHATRAS = [
     "Ashwini", "Bharani", "Krittika", "Rohini", "Mrigashira", "Ardra",
     "Punarvasu", "Pushya", "Ashlesha", "Magha", "Purva Phalguni",
-    "Uttara Phalguni", "Hasta", "Chitra", "Swati", "Vishakha",
-    "Anuradha", "Jyeshtha", "Mula", "Purva Ashadha", "Uttara Ashadha",
-    "Shravana", "Dhanishta", "Shatabhisha", "Purva Bhadrapada",
-    "Uttara Bhadrapada", "Revati",
+    "Uttara Phalguni", "Hasta", "Chitra", "Swati", "Vishakha", "Anuradha",
+    "Jyeshtha", "Mula", "Purva Ashadha", "Uttara Ashadha", "Shravana",
+    "Dhanishta", "Shatabhisha", "Purva Bhadrapada", "Uttara Bhadrapada", "Revati",
 ]
-
-# The dasha lord sequence (Vimshottari), and each lord's period in years.
-DASHA_LORDS = [
-    ("Ketu", 7), ("Venus", 20), ("Sun", 6), ("Moon", 10), ("Mars", 7),
-    ("Rahu", 18), ("Jupiter", 16), ("Saturn", 19), ("Mercury", 17),
-]
-# Each nakshatra is ruled by a dasha lord, cycling through the 9 lords.
-NAKSHATRA_LORD_ORDER = [
-    "Ketu", "Venus", "Sun", "Moon", "Mars", "Rahu", "Jupiter", "Saturn", "Mercury",
-]
-
-
-def nakshatra_of(moon_sidereal_lon: float) -> dict:
-    """Given the Moon's sidereal longitude, find its nakshatra and pada."""
-    lon = moon_sidereal_lon % 360.0
-    span = 360.0 / 27.0          # 13 deg 20 min per nakshatra
-    # A tiny epsilon guards against floating-point error at exact
-    # boundaries (e.g. 120.0 / span computing as 8.9999 instead of 9).
-    index = int((lon + 1e-9) // span)
-    if index > 26:
-        index = 26
-    position_in = lon - index * span
-    pada = int((position_in + 1e-9) // (span / 4.0)) + 1
-    if pada > 4:
-        pada = 4
-    lord = NAKSHATRA_LORD_ORDER[index % 9]
-    return {
-        "nakshatra": NAKSHATRAS[index],
-        "index": index,
-        "pada": pada,
-        "lord": lord,
-        "position": round(position_in, 3),
-        "span": span,
-    }
-
-
-def compute_vimshottari(moon_sidereal_lon: float, birth_jd: float):
-    """Compute the Vimshottari dasha sequence from the Moon's nakshatra.
-    Returns the starting dasha and the sequence of mahadasha periods."""
-    nak = nakshatra_of(moon_sidereal_lon)
-    span = nak["span"]
-    # Fraction of the nakshatra already traversed at birth.
-    fraction_done = nak["position"] / span
-    # Find the starting lord and its total period.
-    start_lord = nak["lord"]
-    lord_names = [l[0] for l in DASHA_LORDS]
-    start_idx = lord_names.index(start_lord)
-    start_period = DASHA_LORDS[start_idx][1]
-    # Balance of the first dasha remaining at birth.
-    balance_years = start_period * (1.0 - fraction_done)
-
-    # Build the mahadasha sequence: first the balance, then full periods.
-    sequence = []
-    age = 0.0
-    # First (partial) dasha
-    sequence.append({
-        "lord": start_lord,
-        "start_age": 0.0,
-        "end_age": round(balance_years, 2),
-        "full_period": start_period,
-        "partial": True,
-    })
-    age = balance_years
-    # The following eight full dashas
-    for i in range(1, 9):
-        lord, period = DASHA_LORDS[(start_idx + i) % 9]
-        sequence.append({
-            "lord": lord,
-            "start_age": round(age, 2),
-            "end_age": round(age + period, 2),
-            "full_period": period,
-            "partial": False,
-        })
-        age += period
-    return {"starting_lord": start_lord, "sequence": sequence}
+# Vimshottari lord cycle (repeats every 9 nakshatras) and each lord's dasha-years.
+DASHA_LORDS = ["Ketu", "Venus", "Sun", "Moon", "Mars", "Rahu", "Jupiter", "Saturn", "Mercury"]
+DASHA_YEARS = {
+    "Ketu": 7, "Venus": 20, "Sun": 6, "Moon": 10, "Mars": 7,
+    "Rahu": 18, "Jupiter": 16, "Saturn": 19, "Mercury": 17,
+}
+# The seven classical grahas used in the Vedic reading (Rahu/Ketu optional).
+VEDIC_PLANETS = {
+    "Sun": swe.SUN, "Moon": swe.MOON, "Mercury": swe.MERCURY,
+    "Venus": swe.VENUS, "Mars": swe.MARS, "Jupiter": swe.JUPITER, "Saturn": swe.SATURN,
+}
 
 
 @app.post("/jyotish")
 def compute_jyotish(req: ChartRequest):
     try:
+        # Sidereal zodiac with the Lahiri ayanamsa (the standard for Jyotish).
+        swe.set_sid_mode(swe.SIDM_LAHIRI, 0, 0)
+
         local = datetime(
             req.year, req.month, req.day, req.hour, req.minute,
             tzinfo=timezone(timedelta(hours=req.tz_offset)),
@@ -225,94 +158,147 @@ def compute_jyotish(req: ChartRequest):
             ut.hour + ut.minute / 60.0 + ut.second / 3600.0,
         )
 
-        # Switch Swiss Ephemeris into SIDEREAL mode, Lahiri ayanamsha.
-        swe.set_sid_mode(swe.SIDM_LAHIRI, 0, 0)
-        flag = swe.FLG_SWIEPH | swe.FLG_SIDEREAL
-
-        # Sidereal planetary positions.
+        flags = swe.FLG_SWIEPH | swe.FLG_SIDEREAL
         planets = {}
         moon_lon = None
-        for name, code in PLANETS.items():
-            result, _ = swe.calc_ut(jd, code, flag)
-            lon = result[0]
+        for name, code in VEDIC_PLANETS.items():
+            result, _ = swe.calc_ut(jd, code, flags)
+            lon = result[0] % 360.0
+            planets[name] = sign_of(lon)
             if name == "Moon":
                 moon_lon = lon
-            info = sign_of(lon)
-            info["retrograde"] = result[3] < 0
-            planets[name] = info
 
-        # Sidereal houses / Lagna (the Vedic rising sign).
-        houses, ascmc = swe.houses_ex(
-            jd, req.latitude, req.longitude, b"W", flag
-        )
-        lagna = sign_of(ascmc[0])
+        # Lagna (ascendant), sidereal. houses_ex supports the sidereal flag;
+        # if unavailable, fall back to tropical ascendant minus the ayanamsa.
+        try:
+            _cusps, ascmc = swe.houses_ex(
+                jd, req.latitude, req.longitude, b"P", swe.FLG_SIDEREAL
+            )
+            asc = ascmc[0] % 360.0
+        except Exception:
+            _houses, ascmc = swe.houses(jd, req.latitude, req.longitude, b"P")
+            asc = (ascmc[0] - swe.get_ayanamsa_ut(jd)) % 360.0
+        lagna = sign_of(asc)
 
-        # The ayanamsha value used (for transparency).
-        ayanamsha = swe.get_ayanamsa_ut(jd)
+        # The Moon's nakshatra and pada (quarter).
+        span = 360.0 / 27.0                    # 13 deg 20 min per nakshatra
+        nak_index = int(moon_lon // span) % 27
+        pos_in_nak = moon_lon - nak_index * span
+        pada = int(pos_in_nak // (span / 4.0)) + 1
+        nak_lord = DASHA_LORDS[nak_index % 9]
+        moon_nakshatra = {
+            "nakshatra": NAKSHATRAS[nak_index],
+            "pada": pada,
+            "lord": nak_lord,
+        }
 
-        # Nakshatra of the Moon, and the Vimshottari dasha sequence.
-        nak = nakshatra_of(moon_lon) if moon_lon is not None else None
-        dasha = compute_vimshottari(moon_lon, jd) if moon_lon is not None else None
-
-        # Reset to tropical so the /chart endpoint is unaffected.
-        swe.set_sid_mode(swe.SIDM_FAGAN_BRADLEY, 0, 0)
+        # Vimshottari dasha: the first period is the nakshatra lord, and only
+        # its BALANCE remains from birth (proportional to how far the Moon has
+        # travelled through the nakshatra). Then each subsequent lord in turn.
+        frac_traversed = pos_in_nak / span
+        start_i = DASHA_LORDS.index(nak_lord)
+        balance = (1.0 - frac_traversed) * DASHA_YEARS[nak_lord]
+        seq = []
+        age = 0.0
+        for k in range(9):
+            lord = DASHA_LORDS[(start_i + k) % 9]
+            full = DASHA_YEARS[lord]
+            dur = balance if k == 0 else full
+            seq.append({
+                "lord": lord,
+                "start_age": round(age, 2),
+                "end_age": round(age + dur, 2),
+                "full_period": full,
+                "partial": (k == 0),
+            })
+            age += dur
 
         return {
             "ok": True,
-            "system": "Jyotish (sidereal, Lahiri ayanamsha)",
             "julian_day": round(jd, 6),
-            "ayanamsha": round(ayanamsha, 4),
-            "planets": planets,
+            "ayanamsa": round(swe.get_ayanamsa_ut(jd), 4),
             "lagna": lagna,
-            "moon_nakshatra": nak,
-            "dasha": dasha,
+            "planets": planets,
+            "moon_nakshatra": moon_nakshatra,
+            "dasha": {"sequence": seq},
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Jyotish calculation failed: {e}")
 
 
 # ════════════════════════════════════════════════════════════════
-# ASSISTANT
+# ASSISTANT — the AstroTeric bot
 # ════════════════════════════════════════════════════════════════
-SYSTEM_PROMPT = """You are the AstroTeric Assistant — a knowledgeable, honest guide \
-within the AstroTeric app, which blends numerology, Western astrology, Chinese \
-zodiac, and BaZi (Four Pillars).
+
+# The assistant's character. This is the heart of the bot — it defines
+# how it behaves. Grounded, honest, never sugar-coated; a tool for the
+# practitioner and the serious newcomer alike.
+SYSTEM_PROMPT = """You are the Oracle — the in-app guide of AstroTeric, an esoteric \
+reference app that computes and teaches numerology (classical Pythagorean and \
+Chaldean), Western astrology, Vedic astrology (Jyotish), Chinese astrology and BaZi \
+(Four Pillars), tarot, palmistry, and related traditions. You answer questions from \
+people using the app — about their own chart, or about any concept in these systems.
+
+GROUND TRUTH ABOUT THE APP
+- You may be given a CHART CONTEXT block describing what AstroTeric contains and the \
+current user's computed placements. Treat it as authoritative about the app.
+- NEVER tell a user that a system, feature, or topic is "not in the app" if it appears \
+in that context or in the list above. AstroTeric FULLY includes Vedic astrology / \
+Jyotish — nakshatras, padas, the Lagna, and the Vimshottari dasha — alongside \
+numerology, Western astrology, Chinese astrology and BaZi, tarot, palmistry, and a \
+large Teachings library.
+- If a user's specific data for some system is not shown in the provided context, it \
+simply has not been computed in this session yet — it computes in the Reading tab once \
+a birth time and place are set. Say that and point them there. Do NOT deny the feature \
+exists.
+- When a topic runs deep, point the user to its entry in the app's Teachings, and to \
+Your Daily (day energies) or the Date Explorer (choosing good-energy days) where useful.
 
 YOUR ROLE
-You are a practitioner's tool and a guide for serious newcomers. Two kinds of \
-questions: (A) questions about a specific chart, when chart data is provided, and \
-(B) general questions about esoteric systems and their concepts. Answer both.
+A practitioner's tool and a guide for serious newcomers. Two kinds of questions: (A) \
+questions about a specific chart, when chart data is provided, and (B) general \
+questions about esoteric systems and their concepts. Answer both.
 
 YOUR CHARACTER
-- Honest above all. Never sugar-coat, never give false hope, never inflate. If a \
-placement is challenging, say so plainly and constructively. People come to you \
-because they want the real thing, not flattery.
-- Grounded. When chart data is provided, base your answer on THAT data. Do not \
-invent placements. If asked about something not in the data, say it isn't available.
-- Clear. Explain esoteric terms in plain language. A newcomer should understand you; \
-a practitioner should respect you.
+- Honest above all. Never sugar-coat, never give false hope, never inflate. Name the \
+shadow as readily as the gift. People come to you for the real thing, not flattery.
+- Grounded. When chart data is provided, base your answer on THAT data, using the \
+person's actual numbers and placements by name. Do not invent placements.
+- Clear. Explain esoteric terms in plain language. A newcomer should understand you; a \
+practitioner should respect you.
 - Humble about the nature of this knowledge. These are interpretive traditions, not \
 deterministic science. Frame readings as lenses for reflection, to be tested against \
 real life — never as fixed fate or prediction.
 
-FIRM LIMITS — not negotiable:
+A NOTE ON NUMEROLOGY METHOD
+The Life Path can be computed two classical ways (digit-sum and component); they agree \
+for most people and diverge only around master numbers. If the context notes a \
+divergence, explain both honestly and note they share the same root — the lived \
+reading holds either way. The app lets the user set their preferred method in Settings.
+
+FIRM LIMITS — these are not negotiable:
 - No medical advice or health diagnoses. Redirect to a doctor.
 - No legal or financial advice. No specific investment, trade, or money guidance.
 - No hard predictions of the future — no death, no disaster, no "you will" certainties.
-- No definitive relationship verdicts. Compatibility describes dynamics, never decrees.
-- If a question is distressing or implies crisis, respond with care and gently \
-suggest talking to a trusted person or professional.
-You assist the person's own judgment — never replace it.
+- No definitive relationship verdicts ("you must leave," "you are doomed together"). \
+Compatibility describes dynamics, never decrees outcomes.
+- If a question is distressing or implies crisis, respond with care and gently suggest \
+talking to a trusted person or professional.
+You are an assistant to the person's own judgment — never a replacement for it. The \
+person decides; you inform.
 
 STYLE
-Concise and substantial — usually 2-4 short paragraphs. No filler. You may use the \
-app's own concepts (Life Path, Day Master, Ten Gods, the trines, the aspects). When \
-relevant, point the person toward the app's Teachings for depth."""
+Concise and substantial — usually 2-4 short paragraphs, plain readable prose, no \
+filler. Use the app's own concepts (Life Path, Day Master, nakshatra, dasha, the \
+trines, the aspects) and the person's own placements by name. When relevant, point \
+toward the app's Teachings for depth."""
 
 
 class AskRequest(BaseModel):
     question: str
+    # Optional chart context — the app sends what it has computed.
     chart_context: Optional[str] = None
+    # Optional short prior exchange, for follow-up questions.
     history: Optional[list] = None
 
 
@@ -327,61 +313,48 @@ def ask_assistant(req: AskRequest):
     if not req.question or not req.question.strip():
         raise HTTPException(status_code=400, detail="No question was provided.")
 
-    # Build the message list.
-    messages = []
-    if req.history:
-        for turn in req.history[-6:]:
-            role = turn.get("role")
-            content = turn.get("content", "")
-            if role in ("user", "assistant") and content:
-                messages.append({"role": role, "content": content})
-
-    user_content = req.question.strip()
-    if req.chart_context:
-        user_content = (
-            f"[The person's chart data, computed by AstroTeric:]\n"
-            f"{req.chart_context}\n\n"
-            f"[Their question:]\n{req.question.strip()}"
-        )
-    messages.append({"role": "user", "content": user_content})
-
-    payload = {
-        "model": "claude-haiku-4-5",
-        "max_tokens": 900,
-        "system": SYSTEM_PROMPT,
-        "messages": messages,
-    }
-    headers = {
-        "x-api-key": api_key.strip(),
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
-
     try:
-        with httpx.Client(timeout=60.0) as client:
-            resp = client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers=headers,
-                json=payload,
+        client = anthropic.Anthropic(api_key=api_key)
+
+        # Build the conversation. Prior history first (if any), then the
+        # current question with its chart context attached.
+        messages = []
+        if req.history:
+            for turn in req.history[-6:]:  # cap history length
+                role = turn.get("role")
+                content = turn.get("content", "")
+                if role in ("user", "assistant") and content:
+                    messages.append({"role": role, "content": content})
+
+        user_content = req.question.strip()
+        if req.chart_context:
+            user_content = (
+                f"[The person's chart data, computed by AstroTeric:]\n"
+                f"{req.chart_context}\n\n"
+                f"[Their question:]\n{req.question.strip()}"
             )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Could not reach the AI service: {e}")
+        messages.append({"role": "user", "content": user_content})
 
-    if resp.status_code != 200:
-        # Pass through the API's own error text so problems are visible.
-        detail = resp.text[:300]
-        raise HTTPException(
-            status_code=502,
-            detail=f"AI service returned {resp.status_code}: {detail}",
+        # NOTE: this model is older and less capable, which is part of why the
+        # Oracle sometimes misreads questions. To upgrade, verify the current
+        # model name in your Anthropic console, then swap the string below —
+        # e.g. a current Haiku for the same cost tier, or a Sonnet for more
+        # depth. Keep the rest of the call unchanged.
+        response = client.messages.create(
+            model="claude-3-5-haiku-20241022",
+            max_tokens=900,
+            system=SYSTEM_PROMPT,
+            messages=messages,
         )
 
-    try:
-        data = resp.json()
+        # Collect the text from the response.
         answer = "".join(
-            block.get("text", "")
-            for block in data.get("content", [])
-            if block.get("type") == "text"
+            block.text for block in response.content
+            if getattr(block, "type", None) == "text"
         )
         return {"ok": True, "answer": answer.strip()}
+
+    except anthropic.APIStatusError as e:
+        raise HTTPException(status_code=502, detail=f"Assistant error: {e.status_code}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Could not read AI response: {e}")
+        raise HTTPException(status_code=500, detail=f"Assistant failed: {e}")

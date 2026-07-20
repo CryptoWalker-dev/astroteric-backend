@@ -289,7 +289,7 @@ class AskRequest(BaseModel):
 
 @app.post("/ask")
 def ask_assistant(req: AskRequest):
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     if not api_key:
         raise HTTPException(
             status_code=503,

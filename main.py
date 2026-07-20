@@ -1,5 +1,4 @@
 
-
 """
 AstroTeric — Backend (Ephemeris + Assistant)
 =============================================
@@ -25,6 +24,7 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import httpx
 import swisseph as swe
 import anthropic
 
@@ -121,7 +121,6 @@ def compute_chart(req: ChartRequest):
 # ════════════════════════════════════════════════════════════════
 # JYOTISH (Vedic) — sidereal chart, Moon's nakshatra, Vimshottari dasha
 # ════════════════════════════════════════════════════════════════
-# The 27 nakshatras (lunar mansions), in order from 0deg sidereal Aries.
 NAKSHATRAS = [
     "Ashwini", "Bharani", "Krittika", "Rohini", "Mrigashira", "Ardra",
     "Punarvasu", "Pushya", "Ashlesha", "Magha", "Purva Phalguni",
@@ -129,13 +128,11 @@ NAKSHATRAS = [
     "Jyeshtha", "Mula", "Purva Ashadha", "Uttara Ashadha", "Shravana",
     "Dhanishta", "Shatabhisha", "Purva Bhadrapada", "Uttara Bhadrapada", "Revati",
 ]
-# Vimshottari lord cycle (repeats every 9 nakshatras) and each lord's dasha-years.
 DASHA_LORDS = ["Ketu", "Venus", "Sun", "Moon", "Mars", "Rahu", "Jupiter", "Saturn", "Mercury"]
 DASHA_YEARS = {
     "Ketu": 7, "Venus": 20, "Sun": 6, "Moon": 10, "Mars": 7,
     "Rahu": 18, "Jupiter": 16, "Saturn": 19, "Mercury": 17,
 }
-# The seven classical grahas used in the Vedic reading (Rahu/Ketu optional).
 VEDIC_PLANETS = {
     "Sun": swe.SUN, "Moon": swe.MOON, "Mercury": swe.MERCURY,
     "Venus": swe.VENUS, "Mars": swe.MARS, "Jupiter": swe.JUPITER, "Saturn": swe.SATURN,
@@ -145,7 +142,6 @@ VEDIC_PLANETS = {
 @app.post("/jyotish")
 def compute_jyotish(req: ChartRequest):
     try:
-        # Sidereal zodiac with the Lahiri ayanamsa (the standard for Jyotish).
         swe.set_sid_mode(swe.SIDM_LAHIRI, 0, 0)
 
         local = datetime(
@@ -168,8 +164,6 @@ def compute_jyotish(req: ChartRequest):
             if name == "Moon":
                 moon_lon = lon
 
-        # Lagna (ascendant), sidereal. houses_ex supports the sidereal flag;
-        # if unavailable, fall back to tropical ascendant minus the ayanamsa.
         try:
             _cusps, ascmc = swe.houses_ex(
                 jd, req.latitude, req.longitude, b"P", swe.FLG_SIDEREAL
@@ -180,8 +174,7 @@ def compute_jyotish(req: ChartRequest):
             asc = (ascmc[0] - swe.get_ayanamsa_ut(jd)) % 360.0
         lagna = sign_of(asc)
 
-        # The Moon's nakshatra and pada (quarter).
-        span = 360.0 / 27.0                    # 13 deg 20 min per nakshatra
+        span = 360.0 / 27.0
         nak_index = int(moon_lon // span) % 27
         pos_in_nak = moon_lon - nak_index * span
         pada = int(pos_in_nak // (span / 4.0)) + 1
@@ -192,9 +185,6 @@ def compute_jyotish(req: ChartRequest):
             "lord": nak_lord,
         }
 
-        # Vimshottari dasha: the first period is the nakshatra lord, and only
-        # its BALANCE remains from birth (proportional to how far the Moon has
-        # travelled through the nakshatra). Then each subsequent lord in turn.
         frac_traversed = pos_in_nak / span
         start_i = DASHA_LORDS.index(nak_lord)
         balance = (1.0 - frac_traversed) * DASHA_YEARS[nak_lord]
@@ -230,9 +220,6 @@ def compute_jyotish(req: ChartRequest):
 # ASSISTANT — the AstroTeric bot
 # ════════════════════════════════════════════════════════════════
 
-# The assistant's character. This is the heart of the bot — it defines
-# how it behaves. Grounded, honest, never sugar-coated; a tool for the
-# practitioner and the serious newcomer alike.
 SYSTEM_PROMPT = """You are the Oracle — the in-app guide of AstroTeric, an esoteric \
 reference app that computes and teaches numerology (classical Pythagorean and \
 Chaldean), Western astrology, Vedic astrology (Jyotish), Chinese astrology and BaZi \
@@ -296,9 +283,7 @@ toward the app's Teachings for depth."""
 
 class AskRequest(BaseModel):
     question: str
-    # Optional chart context — the app sends what it has computed.
     chart_context: Optional[str] = None
-    # Optional short prior exchange, for follow-up questions.
     history: Optional[list] = None
 
 
@@ -314,13 +299,15 @@ def ask_assistant(req: AskRequest):
         raise HTTPException(status_code=400, detail="No question was provided.")
 
     try:
-        client = anthropic.Anthropic(api_key=api_key)
+        # Explicit HTTP client with a generous timeout and a plain transport.
+        # This avoids the SDK's custom transport, the known cause of spurious
+        # "Connection error" failures on some hosts.
+        http_client = httpx.Client(timeout=httpx.Timeout(60.0, connect=15.0))
+        client = anthropic.Anthropic(api_key=api_key, http_client=http_client)
 
-        # Build the conversation. Prior history first (if any), then the
-        # current question with its chart context attached.
         messages = []
         if req.history:
-            for turn in req.history[-6:]:  # cap history length
+            for turn in req.history[-6:]:
                 role = turn.get("role")
                 content = turn.get("content", "")
                 if role in ("user", "assistant") and content:
@@ -335,11 +322,6 @@ def ask_assistant(req: AskRequest):
             )
         messages.append({"role": "user", "content": user_content})
 
-        # NOTE: this model is older and less capable, which is part of why the
-        # Oracle sometimes misreads questions. To upgrade, verify the current
-        # model name in your Anthropic console, then swap the string below —
-        # e.g. a current Haiku for the same cost tier, or a Sonnet for more
-        # depth. Keep the rest of the call unchanged.
         response = client.messages.create(
             model="claude-3-5-haiku-20241022",
             max_tokens=900,
@@ -347,7 +329,6 @@ def ask_assistant(req: AskRequest):
             messages=messages,
         )
 
-        # Collect the text from the response.
         answer = "".join(
             block.text for block in response.content
             if getattr(block, "type", None) == "text"
@@ -355,6 +336,15 @@ def ask_assistant(req: AskRequest):
         return {"ok": True, "answer": answer.strip()}
 
     except anthropic.APIStatusError as e:
-        raise HTTPException(status_code=502, detail=f"Assistant error: {e.status_code}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Assistant error {e.status_code}: {getattr(e, 'message', str(e))}",
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Assistant failed: {e}")
+        cause = getattr(e, "__cause__", None) or getattr(e, "__context__", None)
+        detail = f"{type(e).__name__}: {e}"
+        if cause:
+            detail = f"{detail}  (underlying: {type(cause).__name__}: {cause})"
+        raise HTTPException(status_code=500, detail=f"Assistant failed: {detail}")
+
+     

@@ -323,7 +323,7 @@ def ask_assistant(req: AskRequest):
         messages.append({"role": "user", "content": user_content})
 
         response = client.messages.create(
-            model="claude-3-5-haiku-20241022",
+            model="claude-haiku-4-5",
             max_tokens=900,
             system=SYSTEM_PROMPT,
             messages=messages,
